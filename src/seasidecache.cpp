@@ -727,14 +727,16 @@ QString SeasideCache::determineNameGroup(const CacheItem *cacheItem)
     if (!cacheItem)
         return QString();
 
+    const CacheItem::QContactProxy &contact(cacheItem->getContact());
+
     if (!instancePtr->m_nameGrouper.isNull()) {
-        QString group = instancePtr->m_nameGrouper->nameGroupForContact(cacheItem->contact, groupProperty());
+        QString group = instancePtr->m_nameGrouper->nameGroupForContact(contact, groupProperty());
         if (!group.isNull() && allContactNameGroups.contains(group)) {
             return group;
         }
     }
 
-    const QContactName name(cacheItem->contact.detail<QContactName>());
+    const QContactName name(contact.detail<QContactName>());
     const QString nameProperty(groupProperty() == QString::fromLatin1("firstName") ? name.firstName() : name.lastName());
 
     QString group;
@@ -815,16 +817,14 @@ SeasideCache::CacheItem *SeasideCache::itemById(const QContactId &id, bool requi
 
     CacheItem *item = 0;
 
-    QHash<quint32, CacheItem>::iterator it = instancePtr->m_people.find(iid);
+    QHash<quint32, CacheItem *>::iterator it = instancePtr->m_people.find(iid);
     if (it != instancePtr->m_people.end()) {
-        item = &(*it);
+        item = *it;
     } else {
         // Insert a new item into the cache if the one doesn't exist.
-        item = &(instancePtr->m_people[iid]);
+        item = *instancePtr->m_people.insert(iid, new CacheItem);
         item->iid = iid;
         item->contactState = ContactAbsent;
-
-        item->contact.setId(id);
     }
 
     if (requireComplete) {
@@ -852,16 +852,15 @@ SeasideCache::CacheItem *SeasideCache::existingItem(const QContactId &id)
 
 SeasideCache::CacheItem *SeasideCache::existingItem(quint32 iid)
 {
-    QHash<quint32, CacheItem>::iterator it = instancePtr->m_people.find(iid);
-    return it != instancePtr->m_people.end()
-            ? &(*it)
-            : 0;
+    QHash<quint32, CacheItem *>::iterator it = instancePtr->m_people.find(iid);
+    return it != instancePtr->m_people.end() ? *it : 0;
 }
 
 QContact SeasideCache::contactById(const QContactId &id)
 {
     quint32 iid = internalId(id);
-    return instancePtr->m_people.value(iid, CacheItem()).contact;
+    QHash<quint32, CacheItem *>::iterator it = instancePtr->m_people.find(iid);
+    return it != instancePtr->m_people.end() ? (*it)->getContact() : QContact();
 }
 
 void SeasideCache::ensureCompletion(CacheItem *cacheItem)
@@ -1809,10 +1808,11 @@ bool SeasideCache::event(QEvent *event)
 
             // Remove the contacts from the cache
             foreach (quint32 iid, removeIds) {
-                QHash<quint32, CacheItem>::iterator cacheItem = m_people.find(iid);
+                QHash<quint32, CacheItem *>::iterator cacheItem = m_people.find(iid);
                 if (cacheItem != m_people.end()) {
-                    delete cacheItem->itemData;
+                    CacheItem *item(*cacheItem);
                     m_people.erase(cacheItem);
+                    delete item;
                 }
             }
         }
@@ -1895,7 +1895,7 @@ void SeasideCache::contactsRemoved(const QList<QContactId> &ids)
             item->listeners = 0;
 
             // Remove the links to addressible details
-            updateContactIndexing(item->contact, QContact(), item->iid, QSet<QContactDetail::DetailType>(), item);
+            updateContactIndexing(item->getContact(), QContact(), item->iid, QSet<QContactDetail::DetailType>(), item);
 
             if (!m_keepPopulated) {
                 presentIds.append(id);
@@ -1919,10 +1919,11 @@ void SeasideCache::updateContacts()
 {
     QList<QContactId> contactIds;
 
-    typedef QHash<quint32, CacheItem>::iterator iterator;
+    typedef QHash<quint32, CacheItem *>::iterator iterator;
     for (iterator it = m_people.begin(); it != m_people.end(); ++it) {
-        if (it->contactState != ContactAbsent)
-            contactIds.append(it->apiId());
+        CacheItem *item(*it);
+        if (item->contactState != ContactAbsent)
+            contactIds.append(item->apiId());
     }
 
     updateContacts(contactIds, &m_changedContacts);
@@ -1995,12 +1996,12 @@ void SeasideCache::updateCache(CacheItem *item, const QContact &contact, bool pa
     item->statusFlags = contact.detail<QContactStatusFlags>().flagsValue() | hasValidFlagValue;
 
     if (item->itemData) {
-        item->itemData->updateContact(contact, &item->contact, item->contactState);
+        item->itemData->updateCacheContact(item, contact);
     } else {
-        item->contact = contact;
+        item->setContact(contact);
     }
 
-    item->displayLabel = generateDisplayLabel(item->contact, displayLabelOrder());
+    item->displayLabel = generateDisplayLabel(item->getContact(), displayLabelOrder());
     item->nameGroup = determineNameGroup(item);
 
     if (!initialInsert) {
@@ -2170,7 +2171,7 @@ bool SeasideCache::updateContactIndexing(const QContact &oldContact, const QCont
 void updateDetailsFromCache(QContact &contact, SeasideCache::CacheItem *item, const QSet<QContactDetail::DetailType> &queryDetailTypes)
 {
     // Copy any existing detail types that are in the current record to the new instance
-    foreach (const QContactDetail &existing, item->contact.details()) {
+    foreach (const QContactDetail &existing, item->getContact().details()) {
         const QContactDetail::DetailType existingType(detailType(existing));
 
         static const DetailList contactsTableTypes(contactsTableDetails());
@@ -2322,7 +2323,7 @@ void SeasideCache::applyContactUpdates(const QList<QContact> &contacts, const QS
         CacheItem *item = existingItem(iid);
         if (!item) {
             // We haven't seen this contact before
-            item = &(m_people[iid]);
+            item = *m_people.insert(iid, new CacheItem);
             item->iid = iid;
         } else {
             oldNameGroup = item->nameGroup;
@@ -2336,22 +2337,24 @@ void SeasideCache::applyContactUpdates(const QList<QContact> &contacts, const QS
 
         bool roleDataChanged = false;
 
+        const CacheItem::QContactProxy &itemContact(item->getContact());
+
         // This is a simplification of reality, should we test more changes?
         if (!partialFetch || queryDetailTypes.contains(detailType<QContactAvatar>())) {
-            roleDataChanged |= (contact.details<QContactAvatar>() != item->contact.details<QContactAvatar>());
+            roleDataChanged |= (contact.details<QContactAvatar>() != itemContact.details<QContactAvatar>());
         }
         if (!partialFetch || queryDetailTypes.contains(detailType<QContactGlobalPresence>())) {
-            roleDataChanged |= (contact.detail<QContactGlobalPresence>() != item->contact.detail<QContactGlobalPresence>());
+            roleDataChanged |= (contact.detail<QContactGlobalPresence>() != itemContact.detail<QContactGlobalPresence>());
         }
 
-        roleDataChanged |= updateContactIndexing(item->contact, contact, iid, queryDetailTypes, item);
+        roleDataChanged |= updateContactIndexing(itemContact, contact, iid, queryDetailTypes, item);
 
         updateCache(item, contact, partialFetch, false);
         roleDataChanged |= (item->displayLabel != oldDisplayLabel);
 
         // do this even if !roleDataChanged as name groups are affected by other display label changes
         if (item->nameGroup != oldNameGroup) {
-            if (!ignoreContactForNameGroups(item->contact)) {
+            if (!ignoreContactForNameGroups(itemContact)) {
                 addToContactNameGroup(item->iid, item->nameGroup, &modifiedGroups);
                 removeFromContactNameGroup(item->iid, oldNameGroup, &modifiedGroups);
             }
@@ -2501,7 +2504,7 @@ void SeasideCache::appendContacts(const QList<QContact> &contacts, FilterType fi
 
                 CacheItem *item = existingItem(iid);
                 if (!item) {
-                    item = &(m_people[iid]);
+                    item = *m_people.insert(iid, new CacheItem);
                     item->iid = iid;
                 } else {
                     if (partialFetch) {
@@ -2510,7 +2513,7 @@ void SeasideCache::appendContacts(const QList<QContact> &contacts, FilterType fi
                     }
                 }
 
-                updateContactIndexing(item->contact, contact, iid, queryDetailTypes, item);
+                updateContactIndexing(item->getContact(), contact, iid, queryDetailTypes, item);
                 updateCache(item, contact, partialFetch, true);
 
                 if (filterType == FilterAll) {
@@ -2774,29 +2777,32 @@ void SeasideCache::displayLabelOrderChanged(CacheConfiguration::DisplayLabelOrde
     QSet<QString> modifiedGroups;
 
     // Update the display labels
-    typedef QHash<quint32, CacheItem>::iterator iterator;
+    typedef QHash<quint32, CacheItem *>::iterator iterator;
     for (iterator it = m_people.begin(); it != m_people.end(); ++it) {
-        // Regenerate the display label
-        QString newLabel = generateDisplayLabel(it->contact, static_cast<DisplayLabelOrder>(order));
-        if (newLabel != it->displayLabel) {
-            it->displayLabel = newLabel;
+        CacheItem *item(*it);
+        const CacheItem::QContactProxy &itemContact(item->getContact());
 
-            contactDataChanged(it->iid);
-            reportItemUpdated(&*it);
+        // Regenerate the display label
+        QString newLabel = generateDisplayLabel(itemContact, static_cast<DisplayLabelOrder>(order));
+        if (newLabel != item->displayLabel) {
+            item->displayLabel = newLabel;
+
+            contactDataChanged(item->iid);
+            reportItemUpdated(item);
         }
 
-        if (it->itemData) {
-            it->itemData->displayLabelOrderChanged(static_cast<DisplayLabelOrder>(order));
+        if (item->itemData) {
+            item->itemData->displayLabelOrderChanged(static_cast<DisplayLabelOrder>(order));
         }
 
         // If the contact's name group is derived from display label, it may have changed
-        const QString group(determineNameGroup(&*it));
-        if (group != it->nameGroup) {
-            if (!ignoreContactForNameGroups(it->contact)) {
-                removeFromContactNameGroup(it->iid, it->nameGroup, &modifiedGroups);
+        const QString group(determineNameGroup(item));
+        if (group != item->nameGroup) {
+            if (!ignoreContactForNameGroups(itemContact)) {
+                removeFromContactNameGroup(item->iid, item->nameGroup, &modifiedGroups);
 
-                it->nameGroup = group;
-                addToContactNameGroup(it->iid, it->nameGroup, &modifiedGroups);
+                item->nameGroup = group;
+                addToContactNameGroup(item->iid, item->nameGroup, &modifiedGroups);
             }
         }
     }
@@ -2835,16 +2841,18 @@ void SeasideCache::groupPropertyChanged(const QString &)
     // Update the name groups
     QSet<QString> modifiedGroups;
 
-    typedef QHash<quint32, CacheItem>::iterator iterator;
+    typedef QHash<quint32, CacheItem *>::iterator iterator;
     for (iterator it = m_people.begin(); it != m_people.end(); ++it) {
-        // Update the nameGroup for this contact
-        const QString group(determineNameGroup(&*it));
-        if (group != it->nameGroup) {
-            if (!ignoreContactForNameGroups(it->contact)) {
-                removeFromContactNameGroup(it->iid, it->nameGroup, &modifiedGroups);
+        CacheItem *item(*it);
 
-                it->nameGroup = group;
-                addToContactNameGroup(it->iid, it->nameGroup, &modifiedGroups);
+        // Update the nameGroup for this contact
+        const QString group(determineNameGroup(item));
+        if (group != item->nameGroup) {
+            if (!ignoreContactForNameGroups(item->getContact())) {
+                removeFromContactNameGroup(item->iid, item->nameGroup, &modifiedGroups);
+
+                item->nameGroup = group;
+                addToContactNameGroup(item->iid, item->nameGroup, &modifiedGroups);
             }
         }
     }
@@ -2910,12 +2918,12 @@ QString SeasideCache::exportContacts()
 
     const quint32 selfId = internalId(manager()->selfContactId());
 
-    typedef QHash<quint32, CacheItem>::iterator iterator;
+    typedef QHash<quint32, CacheItem *>::iterator iterator;
     for (iterator it = instancePtr->m_people.begin(); it != instancePtr->m_people.end(); ++it) {
         if (it.key() == selfId) {
             continue;
-        } else if (it->contactState == ContactComplete) {
-            contacts.append(it->contact);
+        } else if ((*it)->contactState == ContactComplete) {
+            contacts.append((*it)->getContact());
         } else {
             contactsToFetch.append(apiId(it.key()));
         }
@@ -3176,7 +3184,7 @@ SeasideCache::CacheItem *SeasideCache::itemMatchingPhoneNumber(const QString &nu
         CacheItem *matchItem = 0;
         for ( ; matchCount > 0; ++it, --matchCount) {
             if (CacheItem *item = existingItem(*it)) {
-                int matchLength = bestPhoneNumberMatchLength(item->contact, normalized);
+                int matchLength = bestPhoneNumberMatchLength(item->getContact(), normalized);
                 if (matchLength > bestMatchLength) {
                     bestMatchLength = matchLength;
                     matchItem = item;

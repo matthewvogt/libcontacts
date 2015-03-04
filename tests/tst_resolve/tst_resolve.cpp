@@ -76,7 +76,7 @@ struct TestResolveListener : public SeasideCache::ResolveListener {
         : m_resolved(false), m_item(0)
         { }
 
-    virtual void addressResolved(const QString &first, const QString &second, SeasideCache::CacheItem *item)
+    virtual void addressResolved(const QString &, const QString &, SeasideCache::CacheItem *item)
         { m_resolved = true; m_item = item; }
 
     bool m_resolved;
@@ -159,7 +159,7 @@ void tst_Resolve::resolveByPhone()
         item = listener.m_item;
     }
 
-    QContactName name = item->contact.detail<QContactName>();
+    QContactName name = item->getContact().detail<QContactName>();
     QCOMPARE(name.firstName(), QString::fromLatin1("Daffy"));
 }
 
@@ -190,7 +190,7 @@ void tst_Resolve::resolveByEmail()
         item = listener.m_item;
     }
 
-    QContactName name = item->contact.detail<QContactName>();
+    QContactName name = item->getContact().detail<QContactName>();
     QCOMPARE(name.firstName(), QString::fromLatin1("Berta"));
 }
 
@@ -221,7 +221,7 @@ void tst_Resolve::resolveByAccount()
         item = listener.m_item;
     }
 
-    QContactName name = item->contact.detail<QContactName>();
+    QContactName name = item->getContact().detail<QContactName>();
     QCOMPARE(name.firstName(), QString::fromLatin1("Berta"));
 }
 
@@ -249,7 +249,7 @@ struct ItemWatcher : public SeasideCache::ItemData {
 
     virtual void displayLabelOrderChanged(SeasideCache::DisplayLabelOrder)
     { }
-    virtual void updateContact(const QtContacts::QContact&, QtContacts::QContact*, SeasideCache::ContactState)
+    virtual void updateCacheContact(SeasideCache::CacheItem *, const QtContacts::QContact &)
     { }
     virtual void mergeCandidatesFetched(const QList<int> &)
     { }
@@ -290,9 +290,9 @@ void tst_Resolve::resolveDuringContactLink()
     QCOMPARE(item2->displayLabel, QString::fromLatin1("Dafferd Duck"));
 
     int iid = item1->iid;
-    item1->itemData = new ItemWatcher;
-    item2->itemData = new ItemWatcher;
-    SeasideCache::aggregateContacts(item1->contact, item2->contact);
+    item1->itemData.reset(new ItemWatcher);
+    item2->itemData.reset(new ItemWatcher);
+    SeasideCache::aggregateContacts(item1->getContact(), item2->getContact());
 
     // Fire off an address resolution simultaneously
     SeasideCache::CacheItem *item;
@@ -312,11 +312,11 @@ void tst_Resolve::resolveDuringContactLink()
     item1 = SeasideCache::existingItem(iid);
     QVERIFY(item1);
     QVERIFY(item1->itemData);
-    QTRY_VERIFY(((ItemWatcher *) item1->itemData)->m_aggregationComplete);
+    QTRY_VERIFY(static_cast<ItemWatcher *>(item1->itemData.data())->m_aggregationComplete);
 
     // the aggregate's constituents are not updated in the cache, so they
     // have to be reloaded before comparing. Is that a bug?
-    SeasideCache::fetchConstituents(item1->contact);
+    SeasideCache::fetchConstituents(item1->getContact());
     QTRY_COMPARE(item1->itemData->constituents().count(), 2);
 
     // Check that the expected two contacts are the constituents.
